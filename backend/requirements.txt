@@ -4,7 +4,9 @@ python-dotenv==1.0.1
 pydantic==2.10.4
 pydantic-settings==2.7.1
 httpx==0.28.1
-yt-dlp==2024.12.13
+# yt-dlp non è fissato: Instagram cambia spesso, serve sempre l'ultima versione
+# dell'estrattore. Ad ogni deploy pip installa la release più recente.
+yt-dlp
 anthropic==0.42.0
 groq==0.15.0
 supabase==2.11.0
