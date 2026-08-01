@@ -1,10 +1,17 @@
 """Download dell'audio da un link (Instagram reel, ecc.) tramite yt-dlp + ffmpeg.
 
 Isolato dal resto: espone solo `download_audio(url) -> DownloadedAudio`.
+
+Strategia robusta:
+1. yt-dlp scarica la traccia audio grezza (senza post-processing fragile).
+2. La convertiamo noi in mp3 con una chiamata diretta a ffmpeg (tollerante).
+3. Se ffmpeg non ce la fa, passiamo comunque il file grezzo alla trascrizione
+   (Groq accetta m4a/webm/mp4/ogg ecc.).
 """
 from __future__ import annotations
 
-import os
+import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,16 +31,36 @@ class DownloadedAudio:
     path: str
     title: Optional[str]
     duration: Optional[float]
+    _tmpdir: Optional[str] = None
 
     def cleanup(self) -> None:
-        try:
-            os.remove(self.path)
-        except OSError:
-            pass
+        if self._tmpdir:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+
+def _convert_to_mp3(src: str, dst: str) -> bool:
+    """Converte `src` in un mp3 mono 16kHz (ottimo per Whisper) con ffmpeg.
+
+    Ritorna True se l'output è stato creato correttamente, False altrimenti.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    try:
+        subprocess.run(
+            [ffmpeg, "-y", "-i", src, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "96k", dst],
+            check=True,
+            capture_output=True,
+            timeout=240,
+        )
+    except Exception:  # noqa: BLE001 — qualsiasi problema ffmpeg -> fallback
+        return False
+    out = Path(dst)
+    return out.is_file() and out.stat().st_size > 0
 
 
 def download_audio(url: str) -> DownloadedAudio:
-    """Scarica solo la traccia audio del reel e la converte in mp3.
+    """Scarica la traccia audio del reel e la prepara per la trascrizione.
 
     Solleva DownloadError con un messaggio pulito in caso di problemi
     (link non valido, contenuto privato/login richiesto, nessun media).
@@ -48,13 +75,6 @@ def download_audio(url: str) -> DownloadedAudio:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "128",
-            }
-        ],
     }
 
     cookies_file = settings.ytdlp_cookies_file.strip()
@@ -65,6 +85,7 @@ def download_audio(url: str) -> DownloadedAudio:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except Exception as exc:  # noqa: BLE001 — yt-dlp solleva vari tipi
+        shutil.rmtree(tmpdir, ignore_errors=True)
         msg = str(exc).lower()
         if "login" in msg or "rate-limit" in msg or "private" in msg or "cookies" in msg:
             raise DownloadError(
@@ -73,14 +94,24 @@ def download_audio(url: str) -> DownloadedAudio:
             ) from exc
         raise DownloadError(f"Impossibile scaricare l'audio dal link: {exc}") from exc
 
-    # Dopo la post-elaborazione il file è audio.mp3
-    audio_path = str(Path(tmpdir) / "audio.mp3")
-    if not Path(audio_path).is_file():
-        # fallback: prendi il primo file nella cartella
-        files = list(Path(tmpdir).glob("audio.*"))
-        if not files:
-            raise DownloadError("Download completato ma nessun file audio trovato.")
-        audio_path = str(files[0])
+    # Individua il file scaricato (estensione variabile: m4a/webm/mp4/...)
+    files = sorted(Path(tmpdir).glob("audio.*"))
+    if not files:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise DownloadError("Download completato ma nessun file audio trovato.")
+    raw = files[0]
+
+    # Un file minuscolo di solito significa contenuto bloccato (login/anteprima)
+    if raw.stat().st_size < 1024:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise DownloadError(
+            "Instagram non ha restituito l'audio (contenuto forse privato o non "
+            "disponibile senza login)."
+        )
+
+    # Prova a convertire in mp3; se fallisce usa il file grezzo (Groq lo accetta)
+    mp3 = str(Path(tmpdir) / "converted.mp3")
+    audio_path = mp3 if _convert_to_mp3(str(raw), mp3) else str(raw)
 
     title = None
     duration = None
@@ -88,4 +119,4 @@ def download_audio(url: str) -> DownloadedAudio:
         title = info.get("title")
         duration = info.get("duration")
 
-    return DownloadedAudio(path=audio_path, title=title, duration=duration)
+    return DownloadedAudio(path=audio_path, title=title, duration=duration, _tmpdir=tmpdir)
