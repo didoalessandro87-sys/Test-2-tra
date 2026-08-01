@@ -70,9 +70,13 @@ def download_audio(url: str) -> DownloadedAudio:
     outtmpl = str(Path(tmpdir) / "audio.%(ext)s")
 
     ydl_opts = {
-        # Sceglie SOLO formati che contengono davvero una traccia audio
-        # (evita flussi video-only che poi darebbero "no audio track").
-        "format": "bestaudio[acodec!=none]/best[acodec!=none]/best",
+        # Vogliamo SEMPRE una traccia audio:
+        #  1) bestaudio*  = miglior formato che contiene audio (anche con video)
+        #  2) bv*+ba      = per i reel con stream separati, unisce video+audio
+        #  3) best        = ripiego finale
+        # merge_output_format serve al caso (2), così esce un mp4 con l'audio.
+        "format": "bestaudio*/bv*+ba/best",
+        "merge_output_format": "mp4",
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
