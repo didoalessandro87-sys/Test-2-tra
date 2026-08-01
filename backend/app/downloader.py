@@ -70,7 +70,9 @@ def download_audio(url: str) -> DownloadedAudio:
     outtmpl = str(Path(tmpdir) / "audio.%(ext)s")
 
     ydl_opts = {
-        "format": "bestaudio/best",
+        # Sceglie SOLO formati che contengono davvero una traccia audio
+        # (evita flussi video-only che poi darebbero "no audio track").
+        "format": "bestaudio[acodec!=none]/best[acodec!=none]/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
