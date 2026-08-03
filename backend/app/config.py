@@ -23,7 +23,10 @@ class Settings(BaseSettings):
 
     # Rete / vari
     cors_origins: str = "*"
+    # Cookie per yt-dlp (Instagram loggato): o un percorso a un file...
     ytdlp_cookies_file: str = ""
+    # ...oppure direttamente il contenuto del cookies.txt (comodo su Render).
+    ytdlp_cookies_content: str = ""
 
     @property
     def cors_origins_list(self) -> list[str]:

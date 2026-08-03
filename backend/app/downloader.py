@@ -47,16 +47,42 @@ def _looks_like_login(exc: Exception) -> bool:
     return any(k in msg for k in ("login", "rate-limit", "private", "cookies", "sign in", "log in"))
 
 
-def _base_opts() -> dict:
+_COOKIES_TMP: Optional[str] = None
+
+
+def _cookies_path() -> Optional[str]:
+    """Percorso a un file cookies.txt, da file esplicito o dal contenuto in env.
+
+    Su Render è comodo incollare il contenuto del cookies.txt nella variabile
+    YTDLP_COOKIES_CONTENT: qui lo scriviamo una volta in un file temporaneo.
+    """
+    global _COOKIES_TMP
     settings = get_settings()
+
+    explicit = settings.ytdlp_cookies_file.strip()
+    if explicit and Path(explicit).is_file():
+        return explicit
+
+    content = settings.ytdlp_cookies_content.strip()
+    if content:
+        if _COOKIES_TMP and Path(_COOKIES_TMP).is_file():
+            return _COOKIES_TMP
+        path = Path(tempfile.gettempdir()) / "ig_cookies.txt"
+        path.write_text(content + "\n", encoding="utf-8")
+        _COOKIES_TMP = str(path)
+        return _COOKIES_TMP
+    return None
+
+
+def _base_opts() -> dict:
     opts = {
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
     }
-    cookies_file = settings.ytdlp_cookies_file.strip()
-    if cookies_file and Path(cookies_file).is_file():
-        opts["cookiefile"] = cookies_file
+    cookies = _cookies_path()
+    if cookies:
+        opts["cookiefile"] = cookies
     return opts
 
 
