@@ -2,14 +2,18 @@
 
 Isolato dal resto: espone solo `download_audio(url) -> DownloadedAudio`.
 
-Strategia robusta:
-1. yt-dlp scarica la traccia audio grezza (senza post-processing fragile).
-2. La convertiamo noi in mp3 con una chiamata diretta a ffmpeg (tollerante).
-3. Se ffmpeg non ce la fa, passiamo comunque il file grezzo alla trascrizione
-   (Groq accetta m4a/webm/mp4/ogg ecc.).
+Strategia a due tentativi:
+  Tentativo 1 (strada principale, affidabile per i reel normali):
+      yt-dlp scarica `bestaudio/best` ed estrae l'audio in mp3 con il suo
+      post-processore (FFmpegExtractAudio).
+  Tentativo 2 (piano B per i reel "ostici", solo se il 1 fallisce):
+      scarica il video completo (video+audio, uniti se separati) e ne estraiamo
+      noi l'audio con una chiamata diretta a ffmpeg. Se anche la conversione
+      fallisce, passiamo il file grezzo alla trascrizione (Groq accetta mp4/m4a).
 """
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import tempfile
@@ -38,11 +42,34 @@ class DownloadedAudio:
             shutil.rmtree(self._tmpdir, ignore_errors=True)
 
 
-def _convert_to_mp3(src: str, dst: str) -> bool:
-    """Converte `src` in un mp3 mono 16kHz (ottimo per Whisper) con ffmpeg.
+def _looks_like_login(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(k in msg for k in ("login", "rate-limit", "private", "cookies", "sign in", "log in"))
 
-    Ritorna True se l'output è stato creato correttamente, False altrimenti.
-    """
+
+def _base_opts() -> dict:
+    settings = get_settings()
+    opts = {
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    cookies_file = settings.ytdlp_cookies_file.strip()
+    if cookies_file and Path(cookies_file).is_file():
+        opts["cookiefile"] = cookies_file
+    return opts
+
+
+def _run(url: str, tmpdir: str, extra: dict) -> dict:
+    outtmpl = str(Path(tmpdir) / "audio.%(ext)s")
+    ydl_opts = {**_base_opts(), "outtmpl": outtmpl, **extra}
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+    return info if isinstance(info, dict) else {}
+
+
+def _convert_to_mp3(src: str, dst: str) -> bool:
+    """Estrae/riconverte l'audio di `src` in un mp3 mono 16kHz (ideale per Whisper)."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return False
@@ -53,76 +80,114 @@ def _convert_to_mp3(src: str, dst: str) -> bool:
             capture_output=True,
             timeout=240,
         )
-    except Exception:  # noqa: BLE001 — qualsiasi problema ffmpeg -> fallback
+    except Exception:  # noqa: BLE001
         return False
     out = Path(dst)
     return out.is_file() and out.stat().st_size > 0
 
 
-def download_audio(url: str) -> DownloadedAudio:
-    """Scarica la traccia audio del reel e la prepara per la trascrizione.
+def _has_audio_stream(path: str) -> bool:
+    """True se il file ha almeno una traccia audio (via ffprobe).
 
-    Solleva DownloadError con un messaggio pulito in caso di problemi
-    (link non valido, contenuto privato/login richiesto, nessun media).
+    In caso di dubbio (ffprobe assente o errore) ritorna True per non bloccare.
     """
-    settings = get_settings()
-    tmpdir = tempfile.mkdtemp(prefix="reel_")
-    outtmpl = str(Path(tmpdir) / "audio.%(ext)s")
-
-    ydl_opts = {
-        # Vogliamo SEMPRE una traccia audio:
-        #  1) bestaudio*  = miglior formato che contiene audio (anche con video)
-        #  2) bv*+ba      = per i reel con stream separati, unisce video+audio
-        #  3) best        = ripiego finale
-        # merge_output_format serve al caso (2), così esce un mp4 con l'audio.
-        "format": "bestaudio*/bv*+ba/best",
-        "merge_output_format": "mp4",
-        "outtmpl": outtmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
-
-    cookies_file = settings.ytdlp_cookies_file.strip()
-    if cookies_file and Path(cookies_file).is_file():
-        ydl_opts["cookiefile"] = cookies_file
-
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return True
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except Exception as exc:  # noqa: BLE001 — yt-dlp solleva vari tipi
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        msg = str(exc).lower()
-        if "login" in msg or "rate-limit" in msg or "private" in msg or "cookies" in msg:
+        res = subprocess.run(
+            [ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams", path],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        data = json.loads(res.stdout or b"{}")
+        return any(s.get("codec_type") == "audio" for s in data.get("streams", []))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _first_audio_file(tmpdir: str) -> Optional[Path]:
+    files = sorted(Path(tmpdir).glob("audio.*"))
+    return files[0] if files else None
+
+
+def download_audio(url: str) -> DownloadedAudio:
+    """Scarica la traccia audio del reel e la prepara per la trascrizione."""
+    # ---- Tentativo 1: estrazione audio "classica" di yt-dlp (affidabile) -----
+    t1 = tempfile.mkdtemp(prefix="reel1_")
+    try:
+        info = _run(
+            url,
+            t1,
+            {
+                "format": "bestaudio/best",
+                "postprocessors": [
+                    {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}
+                ],
+            },
+        )
+        mp3 = Path(t1) / "audio.mp3"
+        if mp3.is_file() and mp3.stat().st_size > 1024:
+            return DownloadedAudio(
+                path=str(mp3),
+                title=info.get("title"),
+                duration=info.get("duration"),
+                _tmpdir=t1,
+            )
+    except Exception as exc:  # noqa: BLE001
+        if _looks_like_login(exc):
+            shutil.rmtree(t1, ignore_errors=True)
+            raise DownloadError(
+                "Instagram ha richiesto il login per questo contenuto. "
+                "Configura un file cookie (YTDLP_COOKIES_FILE) nel backend."
+            ) from exc
+        # altrimenti: passa al piano B
+    shutil.rmtree(t1, ignore_errors=True)
+
+    # ---- Tentativo 2: video completo + estrazione audio "a mano" -------------
+    t2 = tempfile.mkdtemp(prefix="reel2_")
+    try:
+        info = _run(
+            url,
+            t2,
+            {
+                # default "intelligente" di yt-dlp: video+audio (uniti se separati)
+                "format": "bestvideo*+bestaudio/best",
+                "merge_output_format": "mp4",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(t2, ignore_errors=True)
+        if _looks_like_login(exc):
             raise DownloadError(
                 "Instagram ha richiesto il login per questo contenuto. "
                 "Configura un file cookie (YTDLP_COOKIES_FILE) nel backend."
             ) from exc
         raise DownloadError(f"Impossibile scaricare l'audio dal link: {exc}") from exc
 
-    # Individua il file scaricato (estensione variabile: m4a/webm/mp4/...)
-    files = sorted(Path(tmpdir).glob("audio.*"))
-    if not files:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise DownloadError("Download completato ma nessun file audio trovato.")
-    raw = files[0]
-
-    # Un file minuscolo di solito significa contenuto bloccato (login/anteprima)
+    raw = _first_audio_file(t2)
+    if raw is None:
+        shutil.rmtree(t2, ignore_errors=True)
+        raise DownloadError("Download completato ma nessun file trovato.")
     if raw.stat().st_size < 1024:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        shutil.rmtree(t2, ignore_errors=True)
         raise DownloadError(
-            "Instagram non ha restituito l'audio (contenuto forse privato o non "
+            "Instagram non ha restituito il contenuto (forse privato o non "
             "disponibile senza login)."
         )
 
-    # Prova a convertire in mp3; se fallisce usa il file grezzo (Groq lo accetta)
-    mp3 = str(Path(tmpdir) / "converted.mp3")
+    # Il reel non ha proprio audio? Messaggio chiaro invece dell'errore di Groq.
+    if not _has_audio_stream(str(raw)):
+        shutil.rmtree(t2, ignore_errors=True)
+        raise DownloadError("Nessuna traccia audio nel reel (video senza sonoro).")
+
+    mp3 = str(Path(t2) / "converted.mp3")
     audio_path = mp3 if _convert_to_mp3(str(raw), mp3) else str(raw)
 
-    title = None
-    duration = None
-    if isinstance(info, dict):
-        title = info.get("title")
-        duration = info.get("duration")
-
-    return DownloadedAudio(path=audio_path, title=title, duration=duration, _tmpdir=tmpdir)
+    return DownloadedAudio(
+        path=audio_path,
+        title=info.get("title"),
+        duration=info.get("duration"),
+        _tmpdir=t2,
+    )
