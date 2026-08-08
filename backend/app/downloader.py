@@ -17,6 +17,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -138,7 +139,36 @@ def _first_audio_file(tmpdir: str) -> Optional[Path]:
     return files[0] if files else None
 
 
+# Errori "intermittenti" tipici del server anonimo throttlato da Instagram:
+# spesso al 2°/3° tentativo la richiesta passa. NON riproviamo i casi "login"
+# (persistenti: si risolvono coi cookie, non riprovando).
+_RETRIABLE = (
+    "nessuna traccia audio",
+    "nessun file",
+    "non ha restituito",
+    "impossibile scaricare",
+)
+
+
 def download_audio(url: str) -> DownloadedAudio:
+    """Wrapper con riprova automatica sugli errori intermittenti di Instagram."""
+    attempts = 3
+    last_exc: Optional[DownloadError] = None
+    for i in range(attempts):
+        try:
+            return _download_pipeline(url)
+        except DownloadError as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            retriable = any(k in msg for k in _RETRIABLE)
+            if not retriable or i == attempts - 1:
+                raise
+            time.sleep(1.5 * (i + 1))  # piccola pausa crescente prima di riprovare
+    assert last_exc is not None
+    raise last_exc
+
+
+def _download_pipeline(url: str) -> DownloadedAudio:
     """Scarica la traccia audio del reel e la prepara per la trascrizione."""
     # ---- Tentativo 1: estrazione audio "classica" di yt-dlp (affidabile) -----
     t1 = tempfile.mkdtemp(prefix="reel1_")
